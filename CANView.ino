@@ -6,22 +6,20 @@
  *
  *  Author:      Gnaddl
  *  Date:        16-APR-2020
- *  Last change: 16-APR-2020
+ *  Last change: 21-APR-2020
  */
 
-#include "Arduino.h"
+#include <Arduino.h>
 #include <SPI.h>
 #include "mcp_can.h"
 
-// the CS pin of the version after v1.1 is default to D9
-// v0.9b and v1.0 is default D10
-const int SPI_CS_PIN = 9;
-const int CAN_INT_PIN = 2;
+// Configuration
+const int SPI_CS_PIN = 9;               // CS pin: D10 for versions v0.9b and v1.0, D9 for versions after v1.1
+const int CAN_INT_PIN = 2;              // interrupt pin
+const int CAN_CLOCK = MCP_8MHz;         // crystal clock frequency of the CAN bus interface: 8 or 16 MHz
 const int CAN_SPEED = CAN_250KBPS;      // fixed CAN bus speed
-const int CAN_CLOCK = MCP_8MHz;         // Xtal clock of the CAN bus interface, either 8 or 16 MHz
 
-const int FIFO_BUFFER_SIZE = 64;        // must be a power of 2 for faster calculation
-const int FIFO_BUFFER_MASK = FIFO_BUFFER_SIZE - 1;
+const int QUEUE_SIZE = 64;              // max. number of elements in a queue
 
 
 /*
@@ -42,24 +40,25 @@ struct CanMsg
 
 
 /* 
- * Simple FIFO class for CAN messages; no overflow detection.
+ * Simple implementation of a Queue class for CAN messages; no overflow detection.
  */
-class CanMsgFifo
+class CanMsgQueue
 {
 public:
-    CanMsgFifo();                       // Constructor
-    int put(CanMsg *p);                 // add a CAN message to the FIFO
-    bool get(CanMsg *p);                // get a CAN message from the FIFO, if available
+    CanMsgQueue();                      // Constructor
+    bool empty();                       // check whether the queue is empty
+    int push_back(CanMsg *p);           // add a CAN message to the queue
+    bool pop_front(CanMsg *p);          // get a CAN message from the queue, if available
 
 private:
     volatile int readIdx;               // index of the next CAN message to read
     volatile int writeIdx;              // index of the next CAN message to write
-    CanMsg buffer[FIFO_BUFFER_SIZE];    // buffer for a number of CAN messages
+    CanMsg buffer[QUEUE_SIZE];          // buffer for a number of CAN messages
 };
 
 
 MCP_CAN CAN(SPI_CS_PIN);                // Create a CAN port instance
-CanMsgFifo fifo;                        // FIFO for the CAN bus messages
+CanMsgQueue queue;                      // queue for the CAN bus messages
 
 
 /*
@@ -113,34 +112,45 @@ void CanMsg::print()
 /* 
  * Constructor
  */
-CanMsgFifo::CanMsgFifo() :
+CanMsgQueue::CanMsgQueue() :
     readIdx(0),
     writeIdx(0)
 {
 }
 
 
-/* 
- * Add a CAN message to the FIFO
+/*
+ * Check whether the queue is empty
  */
-int CanMsgFifo::put(CanMsg *p)
+bool CanMsgQueue::empty()
 {
-    buffer[writeIdx++] = *p;            // write CAN message to next free position in the FIFO
-    writeIdx &= FIFO_BUFFER_MASK;       // increment write index and handle wrap-around
+    return readIdx == writeIdx;
+}
+
+
+/* 
+ * Add a CAN message to the queue
+ */
+int CanMsgQueue::push_back(CanMsg *p)
+{
+    buffer[writeIdx++] = *p;            // write CAN message to next position in the queue
+    if (writeIdx >= QUEUE_SIZE)
+        writeIdx = 0;
     return 0;
 }
 
 
 /* 
- * Get a CAN message from the FIFO, if available
+ * Get a CAN message from the queue, if available
  */
-bool CanMsgFifo::get(CanMsg *p)
+bool CanMsgQueue::pop_front(CanMsg *p)
 {
-    bool rc = (readIdx != writeIdx);    // is a CAN message available in the FIFO?
+    bool rc = !empty();
     if (rc)
     {
         *p = buffer[readIdx++];         // copy the CAN message
-        readIdx &= FIFO_BUFFER_MASK;    // increment read index and handle wrap-around
+        if (readIdx >= QUEUE_SIZE)
+            readIdx = 0;
     }
     return rc;
 }
@@ -158,6 +168,15 @@ void userInput(int c)
         {
             // Send CANopen message "Start Remote Node" to all slave devices.
             const byte data[] = { 0x01, 0x00 };
+            CanMsg msg(0x00, 2, data);
+            msg.send(CAN);
+            break;
+        }
+
+        case 't':
+        {
+            // Send CANopen message "Stop Remote Node" to all slave devices.
+            const byte data[] = { 0x02, 0x00 };
             CanMsg msg(0x00, 2, data);
             msg.send(CAN);
             break;
@@ -182,7 +201,7 @@ void MCP2515_isr()
         msg.id = id;
         msg.len = len;
 
-        fifo.put(&msg);
+        queue.push_back(&msg);
     }
 }
 
@@ -208,15 +227,15 @@ void setup()
 void loop()
 {
     CanMsg msg;
+    int c;
 
-    while (fifo.get(&msg))
+    while (queue.pop_front(&msg))
     {
         // CAN bus message received, decode and print it
         msg.print();
     }
 
-    int c = Serial.read();
-    if (c != -1)
+    while ((c = Serial.read()) != -1)
     {
         // Character from serial console received
         userInput(c);
